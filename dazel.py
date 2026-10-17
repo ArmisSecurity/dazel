@@ -411,7 +411,7 @@ class DockerInstance:
         self._run_silent_command(self._with_docker_machine(command), ignore_output=True)
         command = "%s rm %s" % (self.docker_command, self.instance_name)
         self._run_silent_command(self._with_docker_machine(command), ignore_output=True)
-        command = "%s run -id --name=%s %s %s %s %s %s %s %s %s %s %s %s%s %s" % (
+        command = "%s run -id --name=%s --ulimit nofile=1048576:1048576 %s %s %s %s %s %s %s %s %s %s %s%s %s" % (
             self.docker_command,
             self.instance_name,
             ("--platform=%s" % self.platform) if self.platform else "",
