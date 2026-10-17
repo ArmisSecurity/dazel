@@ -7,7 +7,7 @@ The problem is that it works in an imperfect and non-portable environment.
 Enter dazel.
 
 dazel allows you to create your build environment as a Docker image, either via a Dockerfile or a prebuilt repository.
-The tool itself is a simple python script that sends the command line arguments directly to bazel inside the container, and maps all of the necessary volumes to make it seamless to you.
+The tool itself is a small Python package that sends the command line arguments directly to bazel inside the container, and maps all of the necessary volumes to make it seamless to you.
 It uses the 'docker exec' command to achieve this, and maps the current directory and the bazel-WORKDIR link directory so that the results appear on the host as if you ran the command locally on the host.
 
 It is run the same way you would bazel:
@@ -23,28 +23,51 @@ Running the command for the first time will start the container on it's own, and
 You can configure anything you need through the ".dazelrc" file in the same directory.
 Take a look at the configuration section for information on how to write one.
 
-It is also possible to run dazel from Windows environment towards a Posix Docker image. You just need to run dazel from a terminal started as Administrator to be able to create links.
-
 ## Installation
 
-### Dependencies
 ```bash
-apt-get install python python-pip
-apt-get install docker-ce
+uv tool install dazel   # or: pipx install dazel / pip install dazel
 ```
 
-### Install dazel
+Requires Python 3.11 or newer and docker. Even bazel is not required on the host.
+
+## Versioning
+
+The PyPI distribution is still called `dazel` but is now published from the
+[ArmisSecurity fork](https://github.com/ArmisSecurity/dazel) as a new `1.x` line: a src-layout package
+with typed modules, replacing the single-file `0.0.x` script. It includes the
+`--ulimit nofile=1048576:1048576` patch shipped in 0.0.43 and keeps every `.dazelrc` key working.
+
+## Parallel git worktrees
+
+By default every workspace shares one container (`dazel`) and one bazel output base, and the container
+is recreated whenever the bound source directory differs, so builds from several git worktrees restart
+each other. Set `DAZEL_PER_WORKSPACE_CONTAINER=True` to get, per workspace:
+
+* a container named `<DAZEL_INSTANCE_NAME>_<md5(realpath(workspace))>` and the bazel output base
+  `<DAZEL_BAZEL_USER_OUTPUT_ROOT>/<md5>`;
+* a **shared** image, compose project and network (compose `up` no longer forces a recreate, so a new
+  worktree never restarts the shared services);
+* host ports published only by the primary checkout. A linked worktree (`.git` is a file pointing into
+  `worktrees/`) publishes none, so fixed `DAZEL_PORTS` do not collide. Override with
+  `DAZEL_PORTS_ONLY_PRIMARY=False`;
+* `DAZEL_BAZEL_DISK_CACHE=/host/path` mounted at the same path in the container (created on the host
+  if missing). dazel passes no bazel flags; point `--disk_cache` at it from your bazelrc.
+
+Remove a workspace's container, output base and run file (read-only directories included) with:
+
 ```bash
-pip install dazel
+dazel --dazel-clean-workspace
 ```
 
-That's all there is to it.
-Even bazel is not required!
+The flag is only recognised as the sole argument, so it cannot collide with bazel's own arguments.
+It refuses to run unless `DAZEL_PER_WORKSPACE_CONTAINER` (or `DAZEL_WORKSPACE_HEX`) is enabled,
+because the container and output base are otherwise shared.
 
 ## Configuration
 
 You can configure dazel in two ways (or combine):
-* A .dazelrc file in the current directory.
+* A `.dazelrc` file in the workspace root (the closest parent holding `WORKSPACE`, `WORKSPACE.bazel` or `MODULE.bazel`). It is executed as Python.
 * Environment variables with the configuration parameters mentioned below.
 
 Note that specific environment variables supercede the values in the .dazelrc file.
@@ -70,7 +93,7 @@ DAZEL_DOCKERFILE="Dockerfile.dazel"  # in DAZEL_DIRECTORY
 # The repository to pull the dazel image from.
 DAZEL_REPOSITORY="dazel"
 
-# The directory to build the dazel image in.
+# The directory to start looking for the bazel workspace from.
 DAZEL_DIRECTORY=$PWD
 
 # The command to run inside the container.
@@ -152,4 +175,50 @@ DAZEL_DELEGATED_VOLUME=True
 # The user, in the same format as the --user option docker run and docker exec takes,
 # to use when starting the container and executing commands inside of the container
 DAZEL_USER=""
+
+# NEW in 1.0 -- see "Parallel git worktrees" below.
+DAZEL_PER_WORKSPACE_CONTAINER=False
+DAZEL_PORTS_ONLY_PRIMARY=True   # default: True when DAZEL_PER_WORKSPACE_CONTAINER is on
+DAZEL_BAZEL_DISK_CACHE=""
 ```
+
+Also available: `DAZEL_RUN_FILE` (default `.dazel_run`, holds the container name),
+`DAZEL_BAZEL_USER_OUTPUT_ROOT` (default `~/.cache/bazel/_bazel_<user>`), `DAZEL_PLATFORM`,
+`DAZEL_SHM_SIZE`, `DAZEL_DOCKER_BUILD_ARGS`, `DAZEL_DOCKER_MACHINE`, `DAZEL_WORKSPACE_HEX` (legacy,
+suffixes container, image and compose project with the workspace hash) and `DAZEL_RC_FILE` (path of
+the rc file to use).
+
+Details worth knowing:
+* `$VAR`, `${VAR}` and `${VAR:-default}` are expanded in `DAZEL_VOLUMES`, `DAZEL_PORTS` and `DAZEL_ENV_VARS`.
+* Boolean variables set from the environment are false when empty, `0`, `false`, `no`, `off` or `none`.
+* Relative `DAZEL_DOCKERFILE`, `DAZEL_DOCKER_COMPOSE_FILE` and `DAZEL_RUN_FILE` are resolved against the workspace root.
+* Commands are executed as argv lists, never through a shell.
+
+
+## Library use
+
+```python
+import dazel
+
+instance = dazel.DockerInstance.from_config()
+instance.docker_command  # "docker"
+instance.instance_name  # "dazel" or "dazel_<md5>" in per-workspace mode
+```
+
+## Development
+
+```bash
+uv sync
+uv run ruff check
+uv run ruff format --check
+uv run pyrefly check
+uv run pytest                  # unit tests; add -m integration for the docker test
+uv build                       # sdist and wheel into dist/
+```
+
+Layout: `config` (rc + env into a frozen `Config`), `workspace`, `plan` (names, ports, mounts),
+`bazel`, `docker` and `compose` (pure argv builders), `executor` (the only subprocess boundary),
+`instance` (lifecycle), `clean`, `cli`.
+
+Releases: push a `v*` tag; the release workflow builds the sdist and wheel and publishes to PyPI
+through trusted publishing.
