@@ -1,0 +1,39 @@
+import os
+import sys
+
+DAZEL_DOCKER_RUN_PRIVILEGED=True  # Required for sandbox to run correctly
+DAZEL_REPOSITORY="armis"
+DAZEL_DOCKERFILE="./deploy/build/Dockerfile.dazel"
+DAZEL_NETWORK="default"
+DAZEL_RUN_DEPS="postgres::armis_postgres,rabbitmq::armis_rabbitmq"
+DAZEL_DOCKER_COMPOSE_FILE="./deploy/build/docker-compose.dazel.yml"
+DAZEL_DOCKER_COMPOSE_PROJECT_NAME="dazel"
+DAZEL_PORTS="127.0.0.1:20000-20006:20000-20006,127.0.0.1:4445:4445"
+DAZEL_BAZEL_USER_OUTPUT_ROOT=os.path.expanduser(
+    "~/.cache/bazel/_bazel_%s/py%s.%s.%s" % (
+        os.environ.get("USER", "user"),
+        sys.version_info.major,
+        sys.version_info.minor,
+        sys.version_info.micro,
+    ),
+)
+
+# dazel overlays any DAZEL_*-prefixed env var on top of this file, so CI (which sets DAZEL_PLATFORM
+# per node label) still overrides this default; it's only the host-arch fallback for local dev.
+HOST_PLATFORM = "linux/arm64" if os.uname().machine in ("arm64", "aarch64") else "linux/amd64"
+DAZEL_DOCKER_BUILD_ARGS = "--platform=%s" % HOST_PLATFORM
+DAZEL_PLATFORM = HOST_PLATFORM
+
+if sys.platform == "darwin":
+    local_docker_sock_location = "$HOME/.colima/default/docker.sock"
+else:
+    local_docker_sock_location = "/var/run/docker.sock"
+
+# Docker got this very stupid idea of putting binaries in a configuration folder :(.
+# Those binaries are being picked up by dazel, and are failing when running on mac due to mismatch
+# of platforms. As such - we need to set the volumes to all the files in the ~/.docker folder except
+# for the cli-plugins which contain the binaries.
+docker_config = [f"$HOME/.docker/{x}:/root/.docker/{x}" for x in os.listdir(os.path.expanduser("~/.docker/")) if x != "cli-plugins"]
+
+# Adding user's aws dir for credentials - used for kb import/export flows
+DAZEL_VOLUMES=f"$HOME/.aws:/root/.aws,/var/run/docker.sock:{local_docker_sock_location},$HOME/.ssh:/root/.ssh,$HOME/.kube:/root/.kube,$HOME/.okta_auth:/root/.okta_auth,$HOME/.armis:/root/.armis," + ",".join(docker_config)

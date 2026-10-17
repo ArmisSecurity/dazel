@@ -1,0 +1,15 @@
+##########################################################################
+# Please Note:                                                           #
+# After updating this file, in order to force dazel container to refresh #
+# please increment DAZEL_RC_VER in deploy/build/Dockerfile.dazel         #
+##########################################################################
+
+DAZEL_DOCKER_RUN_PRIVILEGED=True  # Required for sandbox to run correctly
+DAZEL_REPOSITORY="armis"
+DAZEL_DOCKERFILE="./deploy/build/Dockerfile.dazel"
+DAZEL_VOLUMES="/var/run/docker.sock:/var/run/docker.sock,$HOME/.docker:/root/.docker,/mnt/jenkins_data/workspace/bazel_disk_cache:/mnt/jenkins_data/workspace/bazel_disk_cache"
+DAZEL_COMMAND="/usr/bin/bazel --noworkspace_rc"
+DAZEL_BAZEL_RC_FILE="deploy/.bazelrc"
+DAZEL_WORKSPACE_HEX="1"
+DAZEL_ENV_VARS="OKTA_CLIENT_ID=${OKTA_CLIENT_ID:-''},OKTA_CLIENT_SECRET=${OKTA_CLIENT_SECRET:-''},CA_CERT_PATH=${CA_CERT_PATH:-''},GIT_ASKPASS=${PWD}/.github.com"
+DAZEL_SHM_SIZE="1024m"
