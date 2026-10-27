@@ -13,7 +13,6 @@ import socket
 import subprocess
 import sys
 import uuid
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -212,18 +211,3 @@ def scratch_root(tmp_path: Path) -> Path:
     root = Path.home() / ".cache" / "dazel-itest" / uuid.uuid4().hex[:10]
     root.mkdir(parents=True)
     return root
-
-
-@pytest.fixture
-def lab(tmp_path: Path) -> Iterator[Lab]:
-    """Provide a ``Lab`` and remove its docker resources and files afterwards."""
-    if not docker_ready():
-        skip_unless_required("git and a docker daemon able to pull " + BASE_IMAGE)
-    root = scratch_root(tmp_path)
-    scratch = Lab(root)
-    try:
-        yield scratch
-    finally:
-        scratch.cleanup()
-        if root != tmp_path:
-            shutil.rmtree(root, ignore_errors=True)
