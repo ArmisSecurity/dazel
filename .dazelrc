@@ -1,0 +1,6 @@
+# dazel's own sample configuration: `dazel build //...` in this checkout builds the image from the
+# repository's Dockerfile. See the README for every DAZEL_* option.
+DAZEL_DOCKERFILE = "Dockerfile"
+DAZEL_REPOSITORY = "dazel"
+DAZEL_IMAGE_NAME = "dazel"
+DAZEL_INSTANCE_NAME = "dazel"
