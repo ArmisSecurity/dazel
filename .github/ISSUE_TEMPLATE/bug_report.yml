@@ -1,0 +1,39 @@
+name: Bug report
+description: Something in dazel does not work as documented.
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Minimal steps, ideally a `.dazelrc` and Dockerfile that show the problem. Remove secrets.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: dazel's output, including any traceback.
+      render: text
+  - type: input
+    id: dazel-version
+    attributes:
+      label: dazel version
+      description: Output of `dazel --dazel-version`.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and architecture, Docker version (and Docker Desktop, colima, ...), Python version.
+    validations:
+      required: true
