@@ -1,224 +1,237 @@
 # dazel
-Run Google's bazel inside a docker container via a seamless proxy.
 
-bazel is awesome at creating fast and reproducible builds on your own development environment.
-The problem is that it works in an imperfect and non-portable environment.
+[![CI](https://github.com/ArmisSecurity/dazel/actions/workflows/ci.yml/badge.svg)](https://github.com/ArmisSecurity/dazel/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/dazel)](https://pypi.org/project/dazel/)
+[![Python](https://img.shields.io/pypi/pyversions/dazel)](https://pypi.org/project/dazel/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Enter dazel.
+Run [Bazel](https://bazel.build) inside a Docker container, as if it ran on your host.
 
-dazel allows you to create your build environment as a Docker image, either via a Dockerfile or a prebuilt repository.
-The tool itself is a small Python package that sends the command line arguments directly to bazel inside the container, and maps all of the necessary volumes to make it seamless to you.
-It uses the 'docker exec' command to achieve this, and maps the current directory and the bazel-WORKDIR link directory so that the results appear on the host as if you ran the command locally on the host.
+Bazel builds are fast and reproducible, but only as reproducible as the machine they run on. dazel
+defines the build environment as a Docker image and runs bazel in it through a transparent proxy:
 
-It is run the same way you would bazel:
 ```bash
-dazel build //my/cool/package/...
-dazel run //my/cool/package:target
+dazel build //my/package/...
+dazel test //my/package:tests
+dazel run //my/package:binary -- --flag
 ```
 
-This was a simple build and run.
-The command line arguments were sent as-is into the docker container, and the output was run in the same manner inside the container.
+The arguments go to bazel in the container unchanged (`docker exec`, as an argv list, never through a
+shell). The workspace and bazel's output directories are bind mounted at the same paths, so `bazel-bin`,
+`bazel-out` and the rest work on the host exactly as they would without dazel. The container is built,
+started and restarted on demand.
 
-Running the command for the first time will start the container on it's own, and it will automatically detect if there is need to rebuild or restart the container (if the Dockerfile is newer than the conatiner).
-You can configure anything you need through the ".dazelrc" file in the same directory.
-Take a look at the configuration section for information on how to write one.
+dazel is maintained by [Armis](https://www.armis.com) open source. It was created by
+[nadirizr](https://github.com/nadirizr/dazel); 1.0 is a typed rewrite of the original `dazel.py`
+that keeps its `.dazelrc` format.
 
 ## Installation
 
 ```bash
-uv tool install dazel   # or: pipx install dazel / pip install dazel
+uv tool install dazel     # or: pipx install dazel
 ```
 
-Requires Python 3.11 or newer and docker. Even bazel is not required on the host.
+dazel needs Python 3.11 or newer and Docker. Bazel itself does not need to be installed on the host.
 
-## Versioning
+## Quick start
 
-The PyPI distribution is still called `dazel` but is now published from the
-[ArmisSecurity fork](https://github.com/ArmisSecurity/dazel) as a new `1.x` line: a src-layout package
-with typed modules, replacing the single-file `0.0.x` script. It includes the
-`--ulimit nofile=1048576:1048576` patch shipped in 0.0.43 and keeps every `.dazelrc` key working.
+1. Describe the build environment in a `Dockerfile.dazel` in the workspace root. The
+   [`Dockerfile`](Dockerfile) in this repository is a good start: Debian with
+   [Bazelisk](https://github.com/bazelbuild/bazelisk) installed as `bazel`, so the workspace's
+   `.bazelversion` selects the Bazel release.
+2. Optionally, add a `.dazelrc` next to it (see [Configuration](#configuration)):
+
+   ```python
+   DAZEL_REPOSITORY = "myproject"
+   DAZEL_VOLUMES = ["$HOME/.ssh:/root/.ssh:ro"]
+   DAZEL_PER_WORKSPACE_CONTAINER = True
+   ```
+
+3. Run `dazel build //...`. The first run builds the image and starts the container. Later runs reuse
+   it. dazel restarts the container when the Dockerfile or an rc file changes.
+
+If `DAZEL_DOCKERFILE` does not exist, dazel pulls `DAZEL_REPOSITORY/DAZEL_IMAGE_NAME` instead, so a team
+can share a prebuilt image.
+
+## Commands
+
+All arguments are passed to bazel, except these, which dazel handles when they are the whole command
+line:
+
+| Command | Effect |
+|---|---|
+| `dazel --dazel-version` | Print the dazel version. |
+| `dazel --dazel-container-name` | Print the container name for this workspace (useful in scripts). |
+| `dazel --dazel-clean-workspace` | Remove this workspace's container, bazel output base and run file. This only works in per-workspace mode, because otherwise both are shared. |
+| `dazel --dazel-clean-legacy [--yes]` | List, or with `--yes` delete, the shared output base left behind by dazel 0.0.x. See [Upgrading from 0.0.x](#upgrading-from-00x). |
+
+A command killed by signal N exits with status `128 + N`, like a shell. Ctrl-C reaches bazel in the
+container and does not produce a traceback.
 
 ## Parallel git worktrees
 
-By default every workspace shares one container (`dazel`) and one bazel output base, and the container
-is recreated whenever the bound source directory differs, so builds from several git worktrees restart
-each other. Set `DAZEL_PER_WORKSPACE_CONTAINER=True` to get, per workspace:
+By default all workspaces share one container (`dazel`) and one bazel output base. The container is
+recreated whenever a different workspace uses it, so builds in two git worktrees keep restarting each
+other. Set `DAZEL_PER_WORKSPACE_CONTAINER = True` to give each workspace:
 
-* a container named `<DAZEL_INSTANCE_NAME>_<md5(realpath(workspace))>` and the bazel output base
-  `<DAZEL_BAZEL_USER_OUTPUT_ROOT>/<md5>`;
-* a **shared** image, compose project and network (compose `up` no longer forces a recreate, so a new
-  worktree never restarts the shared services);
-* host ports published only by the primary checkout. A linked worktree (`.git` is a file pointing into
-  `worktrees/`) publishes none, so fixed `DAZEL_PORTS` do not collide. Override with
-  `DAZEL_PORTS_ONLY_PRIMARY=False`;
-* `DAZEL_BAZEL_DISK_CACHE=/host/path` mounted at the same path in the container (created on the host
-  if missing). dazel passes no bazel flags; point `--disk_cache` at it from your bazelrc.
+- **Its own container and output base**: `<DAZEL_INSTANCE_NAME>_<md5>` and
+  `<DAZEL_BAZEL_USER_OUTPUT_ROOT>/<md5>`, keyed on the workspace's real path. dazel writes
+  `WORKSPACE: <path>` into `<base>/README`, so a base whose worktree is gone can be identified and
+  removed.
+- **A shared image, compose project and network.** Compose runs with `--project-directory` set to the
+  compose file's location in the *primary* checkout, so relative bind mounts resolve the same from every
+  worktree and a new worktree never restarts the shared services.
+- **Serialised start-up.** A file lock (`<output root>/.dazel.lock`) guards building the image and
+  starting the services and the container. A dazel that waited checks again once it holds the lock, so
+  concurrent commands start the container once.
+- **Ports from the primary checkout only.** Linked worktrees publish no `DAZEL_PORTS`, so fixed ports
+  don't collide (`DAZEL_PORTS_ONLY_PRIMARY`).
 
-Remove a workspace's container, output base and run file (read-only directories included) with:
-
-```bash
-dazel --dazel-clean-workspace
-```
-
-The flag is only recognised as the sole argument, so it cannot collide with bazel's own arguments.
-It refuses to run unless `DAZEL_PER_WORKSPACE_CONTAINER` (or `DAZEL_WORKSPACE_HEX`) is enabled,
-because the container and output base are otherwise shared.
+A per-workspace output base starts cold. Share work between them with a disk cache:
+`DAZEL_BAZEL_DISK_CACHE = "~/.cache/bazel-disk:/root/.cache/bazel-disk"` mounts one host directory in
+every container (creating it first, so Docker doesn't create it root-owned). Point bazel's `--disk_cache`
+at the container path in your bazelrc. dazel passes no bazel flags of its own.
 
 ## Configuration
 
-You can configure dazel in two ways (or combine):
-* A `.dazelrc` file in the workspace root (the closest parent holding `WORKSPACE`, `WORKSPACE.bazel` or `MODULE.bazel`). It is executed as Python.
-* Environment variables with the configuration parameters mentioned below.
+Settings come from four layers. Lowest precedence first:
 
-Note that specific environment variables supercede the values in the .dazelrc file.
+1. `~/.dazelrc`: per-user defaults.
+2. `.dazelrc` in the workspace root, or the file named by the `DAZEL_RC_FILE` environment variable: the
+   project configuration.
+3. `.dazelrc.local` in the workspace root: personal overrides. Add it to `.gitignore`.
+4. `DAZEL_*` environment variables.
 
-The possible parameters to set are (with their defaults):
-```python
-# The name of the docker container to run.
-DAZEL_INSTANCE_NAME="dazel"
+rc files are **executed as Python**, and every top-level `DAZEL_*` name they define is a setting. A later
+layer replaces a key's value whole; lists are not merged.
 
-# The name of the dazel image to build or pull.
-DAZEL_IMAGE_NAME="dazel"
+The workspace root is the closest parent of the current directory (or of `DAZEL_DIRECTORY`) that holds a
+`WORKSPACE`, `WORKSPACE.bazel` or `MODULE.bazel` file.
 
-# The command to run when running the image (the continuous command that will
-# hold the container active while we connect to it).
-DAZEL_RUN_COMMAND="/bin/bash"
+Value rules:
 
-# The command to run to invoke docker (can be changed to `nvidia-docker` for GPUs).
-DAZEL_DOCKER_COMMAND="docker"
+- **Lists** are a Python iterable or a comma-separated string.
+- **Flags** are booleans. From the environment, `""`, `0`, `false`, `no` and `off` are false.
+- **Variables** (`$VAR`, `${VAR}`, `${VAR-default}`, `${VAR:-default}`) are expanded from the environment
+  in `DAZEL_VOLUMES`, `DAZEL_PORTS`, `DAZEL_ENV_VARS` and the path settings. In a value, `$PWD` is the
+  directory dazel was started in.
+- **Paths** (`DAZEL_DOCKERFILE`, `DAZEL_BUILD_DIRECTORY`, `DAZEL_DOCKER_COMPOSE_FILE`, `DAZEL_RUN_FILE`,
+  `DAZEL_BAZEL_DISK_CACHE`) also expand a leading `~`. A relative path resolves against the workspace
+  root.
+- **Commands** (`DAZEL_COMMAND`, `DAZEL_RUN_COMMAND`, `DAZEL_DOCKER_COMMAND`,
+  `DAZEL_DOCKER_COMPOSE_COMMAND`, `DAZEL_DOCKER_BUILD_ARGS`) are split like a shell would split them, but
+  nothing is expanded in them.
 
-# The path to the Dockerfile to use to build the dazel image.
-DAZEL_DOCKERFILE="Dockerfile.dazel"  # in DAZEL_DIRECTORY
+### Image and container
 
-# The repository to pull the dazel image from.
-DAZEL_REPOSITORY="dazel"
+| Key | Default | Meaning |
+|---|---|---|
+| `DAZEL_DOCKERFILE` | `Dockerfile.dazel` | Dockerfile for the image. If it doesn't exist, the image is pulled instead. |
+| `DAZEL_BUILD_DIRECTORY` | workspace root | Build context for `docker build`. |
+| `DAZEL_DOCKER_BUILD_ARGS` | none | Extra `docker build` arguments, such as `--cache-from` or `--build-arg`. |
+| `DAZEL_REPOSITORY` | `dazel` | Image repository, and the registry path it is pulled from. |
+| `DAZEL_IMAGE_NAME` | `dazel` | Image name. |
+| `DAZEL_INSTANCE_NAME` | `dazel` | Container name. |
+| `DAZEL_RUN_COMMAND` | `/bin/bash` | Command that keeps the container alive. |
+| `DAZEL_DOCKER_COMMAND` | `docker` | Docker executable. |
+| `DAZEL_DOCKER_MACHINE` | none | `docker-machine` whose environment is used. |
+| `DAZEL_PLATFORM` | none | `--platform` for build and run, e.g. `linux/amd64` on Apple silicon. |
+| `DAZEL_DOCKER_RUN_PRIVILEGED` | `False` | Run and exec privileged. Needed by bazel's sandbox in most images. |
+| `DAZEL_USER` | none | `--user` for run and exec. |
+| `DAZEL_GROUPS` | none | `--group-add` for each entry, e.g. the host's `docker` group id. |
+| `DAZEL_GPUS` | none | `--gpus`, e.g. `all`. |
+| `DAZEL_SHM_SIZE` | none | `--shm-size`. |
+| `DAZEL_VOLUMES` | none | Extra `host:container[:options]` mounts. |
+| `DAZEL_PORTS` | none | Published ports, `[interface:]host:container`. |
+| `DAZEL_ENV_VARS` | none | `NAME=value` entries passed with `-e`. |
+| `DAZEL_DIRECTORY` | workspace root | Directory mounted and used as the working directory. |
+| `DAZEL_RUN_FILE` | `.dazel_run` | File recording the container name; dazel restarts the container when the Dockerfile or an rc file is newer. Empty disables it, and then the container is only restarted when it isn't running. |
 
-# The directory to start looking for the bazel workspace from.
-DAZEL_DIRECTORY=$PWD
+The container always gets `--ulimit nofile=1048576:1048576`.
 
-# The command to run inside the container.
-# NOTE: You should add flags to the .bazelrc file instead of here, since it is
-#       also shared in the volume and it is a much cleaner way.
-DAZEL_COMMAND="/usr/bin/bazel"
+### Bazel
 
-# Add any additional volumes you want to share between the host and the docker
-# container, in the normal "hostdir:dockerdir" format.
-# This can be a python iterable, or a comma-separated string.
-# If working on windows add drive name to avoid conflicts, e.g.
-# DAZEL_VOLUMES = ["C:\\tmp:/C/tmp"]
-DAZEL_VOLUMES=[]
+| Key | Default | Meaning |
+|---|---|---|
+| `DAZEL_COMMAND` | `/usr/bin/bazel` | Bazel command in the container. Put bazel flags in a bazelrc. |
+| `DAZEL_BAZEL_RC_FILE` | none | `--bazelrc` for the bazel command. |
+| `DAZEL_BAZEL_USER_OUTPUT_ROOT` | `~/.cache/bazel/_bazel_<user>` | Host output root, created if missing. If empty, it is derived from where the workspace's `bazel-out` symlink points. |
+| `DAZEL_BAZEL_DISK_CACHE` | none | `host[:container]` bind mount for bazel's disk cache. The container path defaults to the host path. |
+| `DAZEL_DELEGATED_VOLUME` | `True` | `:delegated` on the output mounts, which is faster on macOS. |
 
-# Add any ports you want to publish from the dazel container to the host, in the
-# normal "interface:dockerport:hostport" (e.g. "0.0.0.0:80:80").
-# This can be useful if you use the "dazel run //my/cool/webserver/target"
-# command for example, and need to publish port 80.
-DAZEL_PORTS=[]
+### Workspace isolation
 
-# Add any environment variables you want to set in the dazel container
-# They will be set via -e in the docker run command
-# This can be a python iterable, or a comma-separated string.
-DAZEL_ENV_VARS=[]
+| Key | Default | Meaning |
+|---|---|---|
+| `DAZEL_PER_WORKSPACE_CONTAINER` | `False` | One container and output base per workspace on a shared image. See [Parallel git worktrees](#parallel-git-worktrees). |
+| `DAZEL_PORTS_ONLY_PRIMARY` | `True` in per-workspace mode, else `False` | Publish `DAZEL_PORTS` only from the primary checkout. |
+| `DAZEL_WORKSPACE_HEX` | `False` | Older isolation mode: suffixes the container, compose project and built image with the workspace hash. |
 
-# The GPUs to expose to the Docker container, "all" for every installed GPU
-DAZEL_GPUS=""
+### Services
 
-# The name of the network on which to load all run dependencies and dazel container.
-# If you are using a docker-compose.yml file to load the environment, this must
-# be the network name to which all of the necessary dependencies are connected.
-DAZEL_NETWORK="dazel"
+| Key | Default | Meaning |
+|---|---|---|
+| `DAZEL_DOCKER_COMPOSE_FILE` | none | Compose file whose services start with the container. |
+| `DAZEL_DOCKER_COMPOSE_SERVICES` | all | Services to start. |
+| `DAZEL_DOCKER_COMPOSE_COMMAND` | `docker-compose` | Compose executable, e.g. `docker compose`. |
+| `DAZEL_DOCKER_COMPOSE_PROJECT_NAME` | `dazel` | Compose project name. |
+| `DAZEL_NETWORK` | `dazel` | Network for the container and its services. With a compose file it is prefixed with the project name, unless it is `host`, `bridge` or `none`. |
+| `DAZEL_RUN_DEPS` | none | Containers started on the same network, as `image[:tag][::name]`. Used when there is no compose file or the compose command isn't installed. |
 
-# Add any additional images that you want to run as dependencies and hook up to
-# the same docker network as the main container.
-# The format is the standard "repository/image:tag", but you can optionally add
-# the name of the container to create with "repository/image:tag::container".
-# This is useful if you want to add "postgres" or "rabbitmq" for instance, and
-# have them run as part of your test environment in a seamless reproducible way.
-# This can be a python iterable, or a comma-separated string.
-# Note: alternatively, you can use a docker-compose.yml file for dependencies.
-DAZEL_RUN_DEPS=[]
+### Recipes
 
-# Add a docker-compose.yml file here to use it to load any services you want to
-# launch as part of the environment for running bazel.
-# This can be a much more complex environment than what is possible using run
-# dependencies.
-# Note: you can control both the project name and which services to run with the
-# variables below.
-DAZEL_DOCKER_COMPOSE_FILE=""
+- **`$HOME` inside the container.** Variables are expanded on the host. To give the container your host
+  home path, pass it explicitly: `DAZEL_ENV_VARS = ["HOME=$HOME"]`.
+- **SSH agent.** Mount the socket and pass its path:
+  `DAZEL_VOLUMES = ["$SSH_AUTH_SOCK:/ssh-agent"]` and `DAZEL_ENV_VARS = ["SSH_AUTH_SOCK=/ssh-agent"]`.
+- **Docker from inside the container.** Mount `/var/run/docker.sock` through `DAZEL_VOLUMES`. When you run
+  as a non-root user, also set `DAZEL_GROUPS` to the socket's group id.
+- **Non-root containers.** With `DAZEL_USER`, set `DAZEL_BAZEL_USER_OUTPUT_ROOT` to a directory that user
+  owns. Docker creates missing bind-mount sources as root.
 
-# The command to run to invoke docker-compose (can be changed to
-# `nvidia-docker-compose` for GPUs).
-DAZEL_DOCKER_COMPOSE_COMMAND="docker-compose"
+## Upgrading from 0.0.x
 
-# If using a docker-compose.yml file, this will set the COMPOSE_PROJECT_NAME
-# environment variable and thus the project name.
-DAZEL_DOCKER_COMPOSE_PROJECT_NAME="dazel"
+1.0 reads the same `.dazelrc` keys. These things behave differently:
 
-# If using a docker-compose.yml file, you can specify the services to run in the
-# file (and empty string means all services - as in running: docker-compose up).
-# This can be a python iterable, or a comma-separated string.
-DAZEL_DOCKER_COMPOSE_SERVICES=""
+- **No shell.** Commands run as argv lists. Values are no longer passed through the host shell, so
+  command substitution, `||`, globs and arithmetic in values are gone; only the variable forms listed in
+  [Configuration](#configuration) are expanded. Compute anything else in the rc file, which is Python, or
+  in the calling script.
+- **Paths.** Relative `DAZEL_DOCKERFILE`, `DAZEL_DOCKER_COMPOSE_FILE` and `DAZEL_RUN_FILE` resolve against
+  the workspace root, not the current directory.
+- **Exit status.** A command killed by a signal exits with `128 + N` instead of raising an exception.
+- **Workspaces.** `WORKSPACE.bazel` and `MODULE.bazel` mark a workspace too. Windows support was dropped.
+- **New in 1.0.**
+  - Per-workspace containers, the disk cache mount, the `--dazel-*` commands.
+  - `~/.dazelrc` and `.dazelrc.local`.
+  - `DAZEL_BUILD_DIRECTORY` and `DAZEL_GROUPS`.
+  - Restarting the container when an rc file changes.
 
-# Whether or not to run in privileged mode (fixes bazel sandboxing issues on some
-# systems). Note that this can be a python boolean equivalent, so if setting
-# this from the environment, simply set it to an empty string.
-DAZEL_DOCKER_RUN_PRIVILEGED=False
+After switching to `DAZEL_PER_WORKSPACE_CONTAINER`, start dazel once (it removes the old shared `dazel`
+container), then run `dazel --dazel-clean-legacy` to see the shared output base 0.0.x left under the
+output root, and `dazel --dazel-clean-legacy --yes` to delete it. Scripts that hard-code the container name
+`dazel` should read `.dazel_run` or call `dazel --dazel-container-name`.
 
-# Path to custom .bazelrc file to use when running the bazel commands.
-DAZEL_BAZEL_RC_FILE=""
-
-# Use the :delegated flag of the --volume option of docker for the bind-mounting of
-# the bazel cache directory. This vastly improves throughput on MacOSX.
-# More information on the :delegated flag: https://docs.docker.com/docker-for-mac/osxfs-caching/.
-# NOTE: This will fail on Docker versions < 17.04.
-DAZEL_DELEGATED_VOLUME=True
-
-# The user, in the same format as the --user option docker run and docker exec takes,
-# to use when starting the container and executing commands inside of the container
-DAZEL_USER=""
-
-# NEW in 1.0 -- see "Parallel git worktrees" below.
-DAZEL_PER_WORKSPACE_CONTAINER=False
-DAZEL_PORTS_ONLY_PRIMARY=True   # default: True when DAZEL_PER_WORKSPACE_CONTAINER is on
-DAZEL_BAZEL_DISK_CACHE=""
-```
-
-Also available: `DAZEL_RUN_FILE` (default `.dazel_run`, holds the container name),
-`DAZEL_BAZEL_USER_OUTPUT_ROOT` (default `~/.cache/bazel/_bazel_<user>`), `DAZEL_PLATFORM`,
-`DAZEL_SHM_SIZE`, `DAZEL_DOCKER_BUILD_ARGS`, `DAZEL_DOCKER_MACHINE`, `DAZEL_WORKSPACE_HEX` (legacy,
-suffixes container, image and compose project with the workspace hash) and `DAZEL_RC_FILE` (path of
-the rc file to use).
-
-Details worth knowing:
-* `$VAR`, `${VAR}` and `${VAR:-default}` are expanded in `DAZEL_VOLUMES`, `DAZEL_PORTS` and `DAZEL_ENV_VARS`.
-* Boolean variables set from the environment are false when empty, `0`, `false`, `no`, `off` or `none`.
-* Relative `DAZEL_DOCKERFILE`, `DAZEL_DOCKER_COMPOSE_FILE` and `DAZEL_RUN_FILE` are resolved against the workspace root.
-* Commands are executed as argv lists, never through a shell.
-
-
-## Library use
-
-```python
-import dazel
-
-instance = dazel.DockerInstance.from_config()
-instance.docker_command  # "docker"
-instance.instance_name  # "dazel" or "dazel_<md5>" in per-workspace mode
-```
+On Linux the container runs as root, so files it writes into bind-mounted directories are root-owned.
+When dazel can't remove them, it retries through a throw-away container of the same image. If that also
+fails, it prints the command to run.
 
 ## Development
 
 ```bash
-uv sync
-uv run ruff check
-uv run ruff format --check
-uv run pyrefly check
-uv run pytest                  # unit tests; add -m integration for the docker test
-uv build                       # sdist and wheel into dist/
+uv sync            # create .venv with dazel and the dev tools
+prek install       # install the pre-commit and commit-msg hooks
+uv run pytest      # unit tests with coverage
+uv run pytest -m integration --no-cov   # lifecycle tests against a real docker daemon
+prek run --all-files                    # ruff, pyrefly, uv.lock and file hygiene
 ```
 
-Layout: `config` (rc + env into a frozen `Config`), `workspace`, `plan` (names, ports, mounts),
-`bazel`, `docker` and `compose` (pure argv builders), `executor` (the only subprocess boundary),
-`instance` (lifecycle), `clean`, `cli`.
+Commit messages and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org).
+[gitfluff](https://github.com/Goldziher/gitfluff) checks them in the `commit-msg` hook and in CI.
 
-Releases: push a `v*` tag; the release workflow builds the sdist and wheel and publishes to PyPI
-through trusted publishing.
+Releases are cut by pushing a `v<version>` tag that matches `pyproject.toml`. The release workflow then
+publishes to PyPI through trusted publishing.
+
+## License
+
+[MIT](LICENSE). Copyright (c) 2016 nadirizr and the dazel contributors.
