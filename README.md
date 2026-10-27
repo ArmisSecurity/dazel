@@ -1,9 +1,9 @@
 # dazel
 
-[![CI](https://github.com/ArmisSecurity/dazel/actions/workflows/ci.yml/badge.svg)](https://github.com/ArmisSecurity/dazel/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/dazel)](https://pypi.org/project/dazel/)
-[![Python](https://img.shields.io/pypi/pyversions/dazel)](https://pypi.org/project/dazel/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/ArmisSecurity/dazel/ci.yml?branch=master&label=CI&color=0A66C2)](https://github.com/ArmisSecurity/dazel/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/dazel?color=0A66C2)](https://pypi.org/project/dazel/)
+[![Python](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2FArmisSecurity%2Fdazel%2Fmaster%2Fpyproject.toml&label=python&color=0A66C2)](pyproject.toml)
+[![License](https://img.shields.io/github/license/ArmisSecurity/dazel?color=0A66C2)](LICENSE)
 
 Run [Bazel](https://bazel.build) inside a Docker container, as if it ran on your host.
 
