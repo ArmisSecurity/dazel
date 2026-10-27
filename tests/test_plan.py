@@ -4,8 +4,7 @@ import pytest
 
 from dazel.plan import host_dirs_to_create, make_plan, publish_ports
 from dazel.workspace import workspace_digest
-
-from fakes import build_config, make_linked_worktree, make_workspace
+from fake_support import build_config, make_linked_worktree, make_workspace
 
 PORTS = {"DAZEL_PORTS": "127.0.0.1:1:1"}
 
@@ -27,13 +26,28 @@ def test_per_workspace_mode_suffixes_container_and_output_base(tmp_path: Path) -
     assert plan.digest == digest
 
 
+@pytest.mark.parametrize("mode", ["DAZEL_PER_WORKSPACE_CONTAINER", "DAZEL_WORKSPACE_HEX"])
+def test_names_and_output_base_are_keyed_on_the_workspace_root_not_the_mounted_subdirectory(
+    tmp_path: Path, mode: str
+) -> None:
+    workspace = make_workspace(tmp_path)
+    nested = workspace / "deep"
+    nested.mkdir()
+    plan = make_plan(build_config(workspace, {mode: "1", "DAZEL_DIRECTORY": str(nested)}))
+    digest = workspace_digest(workspace)
+
+    assert plan.workdir == nested.resolve()
+    assert plan.workspace == workspace.resolve()
+    assert plan.digest == digest
+    assert plan.instance_name == f"dazel_{digest}"
+    assert plan.layout.base == (tmp_path / "out" / digest).resolve()
+
+
 def test_per_workspace_mode_shares_image_project_and_network(tmp_path: Path) -> None:
     env = {"DAZEL_DOCKER_COMPOSE_FILE": "c.yml", "DAZEL_NETWORK": "default"}
     shared = make_plan(build_config(make_workspace(tmp_path, name="a"), env))
     isolated = make_plan(
-        build_config(
-            make_workspace(tmp_path, name="b"), {**env, "DAZEL_PER_WORKSPACE_CONTAINER": "1"}
-        )
+        build_config(make_workspace(tmp_path, name="b"), {**env, "DAZEL_PER_WORKSPACE_CONTAINER": "1"})
     )
     assert (isolated.image_name, isolated.compose_project_name, isolated.network) == (
         shared.image_name,
@@ -131,6 +145,15 @@ def test_disk_cache_is_mounted_at_the_same_path(tmp_path: Path) -> None:
     plan = make_plan(cfg)
     assert plan.volumes[-1] == f"{cache}:{cache}"
     assert cache in host_dirs_to_create(plan, cfg)
+
+
+def test_disk_cache_can_be_mounted_at_another_container_path(tmp_path: Path) -> None:
+    cache = tmp_path / "disk"
+    cfg = build_config(make_workspace(tmp_path), {"DAZEL_BAZEL_DISK_CACHE": f"{cache}:/root/.cache/disk"})
+    plan = make_plan(cfg)
+    assert plan.volumes[-1] == f"{cache}:/root/.cache/disk"
+    assert cache in host_dirs_to_create(plan, cfg)
+    assert Path("/root/.cache/disk") not in host_dirs_to_create(plan, cfg)
 
 
 def test_no_disk_cache_means_no_extra_mount(tmp_path: Path) -> None:

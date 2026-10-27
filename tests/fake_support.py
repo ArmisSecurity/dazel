@@ -1,4 +1,4 @@
-"""Test doubles: a recording executor and workspace builders."""
+"""Test doubles: a recording executor, workspace builders and the shared sandbox fixture."""
 
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -71,7 +71,9 @@ def make_workspace(root: Path, rc: str = "", name: str = "ws") -> Path:
 def make_linked_worktree(primary: Path, name: str = "linked") -> Path:
     """Create a linked git worktree of ``primary`` (as ``git worktree add`` lays it out)."""
     git_dir = primary / ".git"
-    (git_dir / "worktrees" / name).mkdir(parents=True, exist_ok=True)
+    entry = git_dir / "worktrees" / name
+    entry.mkdir(parents=True, exist_ok=True)
+    (entry / "commondir").write_text("../..\n", encoding="utf-8")
     linked = primary.parent / name
     linked.mkdir()
     (linked / "WORKSPACE").touch()
@@ -83,3 +85,15 @@ def build_config(workspace: Path, env: Mapping[str, str] | None = None) -> Confi
     """Load the workspace configuration with its bazel output root inside the test sandbox."""
     root = str(workspace.parent / "out")
     return load_config({"DAZEL_BAZEL_USER_OUTPUT_ROOT": root, **(env or {})}, workspace)
+
+
+def run_file_of(cfg: Config) -> Path:
+    """Return the configured run file, which the test expects to be enabled."""
+    assert cfg.run_file is not None
+    return cfg.run_file
+
+
+# Real-world rc files, kept in sync with the ones Armis runs dazel with.
+FIXTURES = Path(__file__).parent / "fixtures"
+LOCAL_DAZELRC = FIXTURES / "armis.dazelrc"
+CI_DAZELRC = FIXTURES / "armis_ci.dazelrc"

@@ -36,4 +36,14 @@ else:
 docker_config = [f"$HOME/.docker/{x}:/root/.docker/{x}" for x in os.listdir(os.path.expanduser("~/.docker/")) if x != "cli-plugins"]
 
 # Adding user's aws dir for credentials - used for kb import/export flows
-DAZEL_VOLUMES=f"$HOME/.aws:/root/.aws,/var/run/docker.sock:{local_docker_sock_location},$HOME/.ssh:/root/.ssh,$HOME/.kube:/root/.kube,$HOME/.okta_auth:/root/.okta_auth,$HOME/.armis:/root/.armis," + ",".join(docker_config)
+DAZEL_VOLUMES=f"$HOME/.cache/bazel-disk:/root/.cache/bazel-disk,$HOME/.aws:/root/.aws,/var/run/docker.sock:{local_docker_sock_location},$HOME/.ssh:/root/.ssh,$HOME/.kube:/root/.kube,$HOME/.okta_auth:/root/.okta_auth,$HOME/.armis:/root/.armis," + ",".join(docker_config)
+
+# The Bazel disk cache (`--disk_cache=~/.cache/bazel-disk` in .bazelrc, where ~ is /root in the container) is the first
+# DAZEL_VOLUMES entry above, shared with the host and across worktrees. The host dir is created here because docker
+# would otherwise create the missing mount source root-owned.
+os.makedirs(os.path.expanduser("~/.cache/bazel-disk"), exist_ok=True)
+
+# Local development only (CI selects deploy/.dazelrc): one container and bazel output base per checkout,
+# so builds from parallel git worktrees don't restart each other. The image, compose services and network
+# stay shared, and only the primary checkout publishes DAZEL_PORTS. Clean up with `dazel --dazel-clean-workspace`.
+DAZEL_PER_WORKSPACE_CONTAINER = True

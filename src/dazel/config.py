@@ -1,6 +1,7 @@
 """Configuration: ``.dazelrc`` (executed Python) overlaid with ``DAZEL_*`` environment variables."""
 
 import getpass
+import runpy
 import shlex
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -35,17 +36,30 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class RunDep:
-    """A container started next to the dazel container when no compose file is configured."""
+    """A container started next to the dazel container when no compose file is configured.
+
+    ``name`` is empty until resolved against the network (see ``plan.make_plan``) unless the entry
+    spelled it out as ``image::name``.
+    """
 
     image: str
-    name: str
+    name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DiskCache:
+    """A host directory bind mounted into the container for bazel's disk cache."""
+
+    host: Path
+    container: str
 
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Fully resolved dazel configuration; every ``DAZEL_*`` key maps to one field."""
+    """Fully resolved dazel configuration; each recognised ``DAZEL_*`` key maps to one field."""
 
     directory: Path
+    mount_directory: Path | None = None
     instance_name: str = DEFAULT_INSTANCE_NAME
     image_name: str = DEFAULT_IMAGE_NAME
     run_command: tuple[str, ...] = (DEFAULT_RUN_COMMAND,)
@@ -69,14 +83,14 @@ class Config:
     bazel_user_output_root: str = ""
     docker_run_privileged: bool = False
     docker_machine: str = ""
-    run_file: Path = Path(DEFAULT_RUN_FILE)
+    run_file: Path | None = Path(DEFAULT_RUN_FILE)
     workspace_hex: bool = False
     delegated_volume: bool = True
     user: str = ""
     docker_build_args: tuple[str, ...] = ()
     per_workspace_container: bool = False
     ports_only_primary: bool | None = None
-    bazel_disk_cache: Path | None = None
+    bazel_disk_cache: DiskCache | None = None
 
 
 def default_user_output_root() -> str:
@@ -86,8 +100,7 @@ def default_user_output_root() -> str:
 
 def load_rc(path: Path) -> RawConfig:
     """Execute a ``.dazelrc`` file and return the names it defines."""
-    namespace: RawConfig = {}
-    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)  # noqa: S102  # .dazelrc is Python by contract
+    namespace: RawConfig = runpy.run_path(str(path))
     return {key: value for key, value in namespace.items() if key.startswith(ENV_PREFIX)}
 
 
@@ -95,17 +108,18 @@ def load_config(env: Mapping[str, str], cwd: Path) -> Config:
     """Build the configuration for the workspace containing ``cwd``.
 
     Precedence, lowest to highest: defaults, ``.dazelrc``, ``DAZEL_*`` environment variables.
-    ``DAZEL_RC_FILE`` selects another rc file and ``DAZEL_DIRECTORY`` the search start.
+    ``DAZEL_RC_FILE`` selects another rc file. ``DAZEL_DIRECTORY`` is where the workspace search
+    starts and, when set, the directory that is mounted and used as the container's working
+    directory instead of the workspace root found.
     """
     directory = find_workspace(Path(env.get("DAZEL_DIRECTORY", cwd)))
     rc_path = Path(env.get("DAZEL_RC_FILE", directory / RC_FILE_NAME))
     raw = load_rc(rc_path) if rc_path.exists() else {}
     raw.update({k: v for k, v in env.items() if k.startswith(ENV_PREFIX)})
-    return resolve(raw, directory, env)
+    return resolve(raw, directory, {**env, "PWD": str(cwd)})
 
 
 def _split_words(key: str, value: object) -> tuple[str, ...]:
-    """Split a comma separated string, or accept any iterable of strings."""
     if isinstance(value, str):
         items: Iterable[object] = value.split(",")
     elif isinstance(value, Iterable):
@@ -117,14 +131,12 @@ def _split_words(key: str, value: object) -> tuple[str, ...]:
 
 
 def _split_argv(value: object) -> tuple[str, ...]:
-    """Split a command line the way a shell would; accept ready-made sequences."""
     if isinstance(value, str):
         return tuple(shlex.split(value))
     return tuple(str(part) for part in value) if isinstance(value, Iterable) else ()
 
 
 def _to_flag(value: object, *, default: bool) -> bool:
-    """Interpret booleans, including the strings an environment variable can only hold."""
     if value is None:
         return default
     if isinstance(value, str):
@@ -132,11 +144,9 @@ def _to_flag(value: object, *, default: bool) -> bool:
     return bool(value)
 
 
-def _run_dep(entry: str, network: str) -> RunDep:
-    image, separator, name = entry.partition("::")
-    if separator:
-        return RunDep(image, name)
-    return RunDep(entry, f"{network}_{entry.replace('/', '_').replace(':', '_')}")
+def _run_dep(entry: str) -> RunDep:
+    image, _, name = entry.partition("::")
+    return RunDep(image, name)
 
 
 class _Source:
@@ -165,11 +175,22 @@ class _Source:
     def flag(self, key: str, *, default: bool) -> bool:
         return _to_flag(self._get(key), default=default)
 
-    def path(self, key: str, directory: Path) -> Path | None:
-        value = self.text(key)
+    def path(self, key: str, directory: Path, default: str = "") -> Path | None:
+        value = self.text(key, default)
         if not value:
             return None
         return directory / Path(expand_variables(value, self._env)).expanduser()
+
+
+def _disk_cache(spec: str, directory: Path, env: Mapping[str, str]) -> DiskCache | None:
+    if not spec:
+        return None
+    host_part, separator, container = expand_variables(spec, env).partition(":")
+    host = directory / Path(host_part).expanduser()
+    if separator and not container.startswith("/"):
+        msg = f"{ENV_PREFIX}BAZEL_DISK_CACHE container path must be absolute, got {container!r}"
+        raise ConfigError(msg)
+    return DiskCache(host, container if separator else str(host))
 
 
 def resolve(raw: RawConfig, directory: Path, env: Mapping[str, str]) -> Config:
@@ -178,10 +199,11 @@ def resolve(raw: RawConfig, directory: Path, env: Mapping[str, str]) -> Config:
     Variables such as ``$HOME`` in volumes, ports and environment entries are expanded from ``env``.
     """
     source = _Source(raw, env)
-    network = source.text("NETWORK", DEFAULT_NETWORK)
     only_primary = source.text("PORTS_ONLY_PRIMARY")
+    mount = source.text("DIRECTORY")
     return Config(
         directory=directory,
+        mount_directory=Path(mount) if mount else None,
         instance_name=source.text("INSTANCE_NAME", DEFAULT_INSTANCE_NAME),
         image_name=source.text("IMAGE_NAME", DEFAULT_IMAGE_NAME),
         run_command=source.argv("RUN_COMMAND", DEFAULT_RUN_COMMAND),
@@ -195,24 +217,22 @@ def resolve(raw: RawConfig, directory: Path, env: Mapping[str, str]) -> Config:
         gpus=source.words("GPUS"),
         platform=source.text("PLATFORM"),
         shm_size=source.text("SHM_SIZE"),
-        network=network,
-        run_deps=tuple(_run_dep(entry, network) for entry in source.words("RUN_DEPS")),
+        network=source.text("NETWORK", DEFAULT_NETWORK),
+        run_deps=tuple(_run_dep(entry) for entry in source.words("RUN_DEPS")),
         compose_file=source.path("DOCKER_COMPOSE_FILE", directory),
         compose_command=source.argv("DOCKER_COMPOSE_COMMAND", DEFAULT_COMPOSE_COMMAND),
-        compose_project_name=source.text(
-            "DOCKER_COMPOSE_PROJECT_NAME", DEFAULT_COMPOSE_PROJECT_NAME
-        ),
+        compose_project_name=source.text("DOCKER_COMPOSE_PROJECT_NAME", DEFAULT_COMPOSE_PROJECT_NAME),
         compose_services=source.words("DOCKER_COMPOSE_SERVICES"),
         bazel_rc_file=source.text("BAZEL_RC_FILE"),
         bazel_user_output_root=source.text("BAZEL_USER_OUTPUT_ROOT", default_user_output_root()),
         docker_run_privileged=source.flag("DOCKER_RUN_PRIVILEGED", default=False),
         docker_machine=source.text("DOCKER_MACHINE"),
-        run_file=directory / source.text("RUN_FILE", DEFAULT_RUN_FILE),
+        run_file=source.path("RUN_FILE", directory, DEFAULT_RUN_FILE),
         workspace_hex=source.flag("WORKSPACE_HEX", default=False),
         delegated_volume=source.flag("DELEGATED_VOLUME", default=True),
         user=source.text("USER"),
         docker_build_args=source.argv("DOCKER_BUILD_ARGS"),
         per_workspace_container=source.flag("PER_WORKSPACE_CONTAINER", default=False),
         ports_only_primary=_to_flag(only_primary, default=True) if only_primary else None,
-        bazel_disk_cache=source.path("BAZEL_DISK_CACHE", directory),
+        bazel_disk_cache=_disk_cache(source.text("BAZEL_DISK_CACHE"), directory, env),
     )

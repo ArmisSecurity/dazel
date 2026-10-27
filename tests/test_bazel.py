@@ -3,8 +3,7 @@ from pathlib import Path
 import pytest
 
 from dazel.bazel import OutputLayout, bazel_argv, derive_user_root, output_layout
-
-from fakes import build_config, make_workspace
+from fake_support import build_config, make_workspace
 
 
 def test_root_user_gets_container_output_user_root_and_base(tmp_path: Path) -> None:
@@ -34,9 +33,7 @@ def test_empty_command_passes_arguments_through(tmp_path: Path) -> None:
 
 
 def test_command_with_flags_is_split(tmp_path: Path) -> None:
-    cfg = build_config(
-        make_workspace(tmp_path), {"DAZEL_COMMAND": "/usr/bin/bazel --noworkspace_rc"}
-    )
+    cfg = build_config(make_workspace(tmp_path), {"DAZEL_COMMAND": "/usr/bin/bazel --noworkspace_rc"})
     argv = bazel_argv(cfg, OutputLayout(), ["version"])
     assert argv == ["/usr/bin/bazel", "--noworkspace_rc", "version"]
 

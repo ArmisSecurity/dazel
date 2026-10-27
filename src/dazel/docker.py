@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from dazel.config import Config, RunDep
 from dazel.plan import Plan
@@ -21,6 +22,15 @@ class Terminal:
 
 def _each(flag: str, values: Sequence[str]) -> list[str]:
     return [part for value in values for part in (flag, value)]
+
+
+def _bind_mount(path: Path) -> str:
+    """Return a ``--mount`` value binding ``path`` at itself; unlike ``-v`` it allows a ``:`` in the path."""
+    text = str(path)
+    if "," not in text and '"' not in text:
+        return f"type=bind,src={text},dst={text}"
+    quoted = text.replace('"', '""')
+    return f'"type=bind","src={quoted}","dst={quoted}"'
 
 
 def image_ref(cfg: Config, plan: Plan) -> str:
@@ -103,11 +113,15 @@ def image_ls_argv(cfg: Config, plan: Plan) -> list[str]:
     return [*cfg.docker_command, "image", "ls", "--quiet", image_ref(cfg, plan)]
 
 
-def ps_argv(cfg: Config, name: str) -> list[str]:
-    """Build ``docker ps`` printing the names of running containers called exactly ``name``."""
+def ps_argv(cfg: Config, name: str, *, include_stopped: bool = False) -> list[str]:
+    """Build ``docker ps`` printing the names of containers called exactly ``name``.
+
+    Only running containers are listed unless ``include_stopped``.
+    """
     return [
         *cfg.docker_command,
         "ps",
+        *(["--all"] if include_stopped else []),
         *("--filter", f"name=^{name}$"),
         *("--format", "{{.Names}}"),
     ]
@@ -136,3 +150,17 @@ def stop_argv(cfg: Config, name: str) -> list[str]:
 def rm_argv(cfg: Config, name: str) -> list[str]:
     """Build ``docker rm`` for a container."""
     return [*cfg.docker_command, "rm", name]
+
+
+def rm_tree_argv(cfg: Config, plan: Plan, path: Path) -> list[str]:
+    """Build ``docker run`` deleting ``path`` as root, for files the container left root-owned."""
+    return [
+        *cfg.docker_command,
+        "run",
+        "--rm",
+        "--pull=never",
+        *("--entrypoint", "rm"),
+        *("--mount", _bind_mount(path.parent)),
+        image_ref(cfg, plan),
+        *("-rf", str(path)),
+    ]

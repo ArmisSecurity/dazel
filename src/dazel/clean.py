@@ -1,6 +1,8 @@
 """Removal of one workspace's container and bazel output base."""
 
 import logging
+import os
+import shlex
 import shutil
 import stat
 from pathlib import Path
@@ -18,9 +20,12 @@ class UnsafeCleanError(RuntimeError):
 
 
 def _make_writable(path: Path) -> None:
-    for entry in (path, *path.rglob("*")):
-        if not entry.is_symlink() and entry.is_dir():
-            entry.chmod(entry.stat().st_mode | stat.S_IRWXU)
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        directory.chmod(directory.stat().st_mode | stat.S_IRWXU)
+        with os.scandir(directory) as entries:
+            pending.extend(Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False))
 
 
 def remove_tree(path: Path) -> None:
@@ -28,6 +33,29 @@ def remove_tree(path: Path) -> None:
     if path.is_dir() and not path.is_symlink():
         _make_writable(path)
         shutil.rmtree(path)
+
+
+def remove_tree_as_root(cfg: Config, plan: Plan, executor: Executor, path: Path) -> None:
+    """Remove ``path``; on Linux fall back to removing what the root container created as root.
+
+    Raises ``UnsafeCleanError`` with the manual command when even that fails, or when the image
+    that would run it is not present (it is never pulled for this).
+    """
+    try:
+        remove_tree(path)
+    except PermissionError:
+        logger.warning("Some files in %s are owned by root; removing them with docker", path)
+        argv = docker.rm_tree_argv(cfg, plan, path)
+        if not executor.capture(docker.image_ls_argv(cfg, plan)).strip():
+            msg = (
+                f"Could not remove {path}: files created by the container are owned by root, and the image "
+                f"{docker.image_ref(cfg, plan)} is not present to remove them with. "
+                f"Run as root: rm -rf {shlex.quote(str(path))}"
+            )
+            raise UnsafeCleanError(msg) from None
+        if executor.call(argv) or path.exists():
+            msg = f"Could not remove {path}: files created by the container are owned by root. Run: {shlex.join(argv)}"
+            raise UnsafeCleanError(msg) from None
 
 
 def clean_workspace(cfg: Config, plan: Plan, executor: Executor) -> int:
@@ -42,6 +70,7 @@ def clean_workspace(cfg: Config, plan: Plan, executor: Executor) -> int:
     logger.info("Removing container '%s'", plan.instance_name)
     executor.call(docker.stop_argv(cfg, plan.instance_name), output=Output.DISCARD)
     executor.call(docker.rm_argv(cfg, plan.instance_name), output=Output.DISCARD)
-    remove_tree(plan.layout.base)
-    cfg.run_file.unlink(missing_ok=True)
+    remove_tree_as_root(cfg, plan, executor, plan.layout.base)
+    if cfg.run_file:
+        cfg.run_file.unlink(missing_ok=True)
     return 0

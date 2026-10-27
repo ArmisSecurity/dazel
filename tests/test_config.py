@@ -2,17 +2,10 @@ from pathlib import Path
 
 import pytest
 
-from dazel.config import (
-    Config,
-    ConfigError,
-    RunDep,
-    default_user_output_root,
-    load_config,
-    load_rc,
-)
-
-from conftest import FIXTURES
-from fakes import make_workspace
+from dazel.config import Config, ConfigError, DiskCache, RunDep, default_user_output_root, load_config, load_rc
+from dazel.docker import build_argv
+from dazel.plan import make_plan
+from fake_support import CI_DAZELRC, LOCAL_DAZELRC, make_workspace
 
 
 def load(workspace: Path, env: dict[str, str] | None = None) -> Config:
@@ -31,9 +24,7 @@ def test_defaults_without_rc_file(tmp_path: Path) -> None:
 
 
 def test_rc_file_is_executed_python(tmp_path: Path) -> None:
-    workspace = make_workspace(
-        tmp_path, 'import os\nDAZEL_INSTANCE_NAME = "x" + os.sep.join(["", "y"])\nlocal = 1\n'
-    )
+    workspace = make_workspace(tmp_path, 'import os\nDAZEL_INSTANCE_NAME = "x" + os.sep.join(["", "y"])\nlocal = 1\n')
     assert load(workspace).instance_name == "x/y"
 
 
@@ -101,9 +92,7 @@ def test_python_boolean_in_rc_file(tmp_path: Path) -> None:
     assert cfg.docker_run_privileged is True
 
 
-def test_home_is_expanded_in_volumes_ports_and_env_vars(
-    tmp_path: Path, isolated_home: Path
-) -> None:
+def test_home_is_expanded_in_volumes_ports_and_env_vars(tmp_path: Path, isolated_home: Path) -> None:
     rc = 'DAZEL_VOLUMES = "$HOME/.aws:/root/.aws,${HOME}/.ssh:/root/.ssh"\n'
     rc += "DAZEL_ENV_VARS = \"A=${UNSET_VAR:-''},B=$HOME\"\n"
     cfg = load(make_workspace(tmp_path, rc), {"HOME": str(isolated_home)})
@@ -122,15 +111,52 @@ def test_command_lines_are_shell_split(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("entry", "expected"),
+    ("entry", "network_line", "expected"),
     [
-        ("postgres::armis_postgres", RunDep("postgres", "armis_postgres")),
-        ("org/img:1.0", RunDep("org/img:1.0", "dazel_org_img_1.0")),
+        ("postgres::armis_postgres", "", RunDep("postgres", "armis_postgres")),
+        ("org/img:1.0", "", RunDep("org/img:1.0", "dazel_org_img_1.0")),
+        ("org/img:1.0", 'DAZEL_NETWORK = "net"\n', RunDep("org/img:1.0", "net_org_img_1.0")),
+        # Upstream named the dependency from the network *after* the compose project prefix.
+        (
+            "org/img:1.0",
+            'DAZEL_NETWORK = "net"\nDAZEL_DOCKER_COMPOSE_FILE = "c.yml"\nDAZEL_DOCKER_COMPOSE_PROJECT_NAME = "proj"\n',
+            RunDep("org/img:1.0", "proj_net_org_img_1.0"),
+        ),
+        (
+            "img",
+            'DAZEL_DOCKER_COMPOSE_FILE = "c.yml"\nDAZEL_NETWORK = "host"\n',
+            RunDep("img", "host_img"),
+        ),
     ],
+    ids=["named", "default-network", "custom-network", "compose-prefixed-network", "predefined-network-unprefixed"],
 )
-def test_run_deps(tmp_path: Path, entry: str, expected: RunDep) -> None:
-    cfg = load(make_workspace(tmp_path, f"DAZEL_RUN_DEPS = {entry!r}\n"))
-    assert cfg.run_deps == (expected,)
+def test_run_deps(tmp_path: Path, entry: str, network_line: str, expected: RunDep) -> None:
+    cfg = load(make_workspace(tmp_path, f"DAZEL_RUN_DEPS = {entry!r}\n{network_line}"))
+    assert make_plan(cfg).run_deps == (expected,)
+
+
+def test_directory_env_var_is_the_mounted_working_directory(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    nested = workspace / "deep"
+    nested.mkdir()
+    cfg = load_config({"DAZEL_DIRECTORY": str(nested)}, tmp_path)
+    plan = make_plan(cfg)
+
+    assert cfg.directory == workspace.resolve()
+    assert plan.workdir == nested.resolve()
+    assert f"{nested.resolve()}:{nested.resolve()}" in plan.volumes
+    assert f"{workspace.resolve()}:{workspace.resolve()}" not in plan.volumes
+
+
+def test_without_directory_the_discovered_workspace_root_is_mounted(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    assert make_plan(load(workspace)).workdir == workspace.resolve()
+
+
+@pytest.mark.parametrize("env", [{"DAZEL_RUN_FILE": ""}, {}], ids=["env", "rc"])
+def test_empty_run_file_disables_the_run_file(tmp_path: Path, env: dict[str, str]) -> None:
+    rc = 'DAZEL_RUN_FILE = ""\n' if not env else ""
+    assert load(make_workspace(tmp_path, rc), env).run_file is None
 
 
 def test_relative_paths_resolve_against_the_workspace(tmp_path: Path) -> None:
@@ -144,9 +170,7 @@ def test_relative_paths_resolve_against_the_workspace(tmp_path: Path) -> None:
     assert cfg.run_file == root / ".run"
 
 
-@pytest.mark.parametrize(
-    ("raw", "expected"), [(None, None), ("True", True), ("False", False), ("0", False)]
-)
+@pytest.mark.parametrize(("raw", "expected"), [(None, None), ("True", True), ("False", False), ("0", False)])
 def test_ports_only_primary_is_tri_state(
     tmp_path: Path,
     raw: str | None,
@@ -156,24 +180,41 @@ def test_ports_only_primary_is_tri_state(
     assert load(make_workspace(tmp_path), env).ports_only_primary is expected
 
 
-def test_disk_cache_expands_home(tmp_path: Path, isolated_home: Path) -> None:
-    cfg = load(
-        make_workspace(tmp_path),
-        {"HOME": str(isolated_home), "DAZEL_BAZEL_DISK_CACHE": "$HOME/disk"},
-    )
-    assert cfg.bazel_disk_cache == isolated_home / "disk"
+@pytest.mark.parametrize(
+    ("spec", "host", "container"),
+    [
+        ("$HOME/disk", "{home}/disk", "{home}/disk"),
+        ("$HOME/disk:/root/.cache/disk", "{home}/disk", "/root/.cache/disk"),
+        ("/abs/disk", "/abs/disk", "/abs/disk"),
+        ("rel/disk", "{ws}/rel/disk", "{ws}/rel/disk"),
+    ],
+)
+def test_disk_cache_spec(tmp_path: Path, isolated_home: Path, spec: str, host: str, container: str) -> None:
+    workspace = make_workspace(tmp_path)
+    cfg = load(workspace, {"HOME": str(isolated_home), "DAZEL_BAZEL_DISK_CACHE": spec})
+    names = {"home": str(isolated_home), "ws": str(workspace.resolve())}
+    assert cfg.bazel_disk_cache == DiskCache(Path(host.format(**names)), container.format(**names))
 
 
-@pytest.mark.parametrize("name", ["armis.dazelrc", "armis_ci.dazelrc"])
-def test_armis_rc_files_load_unchanged(tmp_path: Path, isolated_home: Path, name: str) -> None:
-    rc = (FIXTURES / name).read_text(encoding="utf-8")
+def test_disk_cache_container_path_must_be_absolute(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="BAZEL_DISK_CACHE"):
+        load(make_workspace(tmp_path), {"DAZEL_BAZEL_DISK_CACHE": "/host:relative"})
+
+
+def test_no_disk_cache_by_default(tmp_path: Path) -> None:
+    assert load(make_workspace(tmp_path)).bazel_disk_cache is None
+
+
+@pytest.mark.parametrize("rc_file", [LOCAL_DAZELRC, CI_DAZELRC], ids=["local", "ci"])
+def test_armis_rc_files_load_unchanged(tmp_path: Path, isolated_home: Path, rc_file: Path) -> None:
+    rc = rc_file.read_text(encoding="utf-8")
     cfg = load(make_workspace(tmp_path, rc), {"HOME": str(isolated_home)})
     assert cfg.repository == "armis"
     assert cfg.docker_run_privileged is True
 
 
 def test_armis_local_rc_values(tmp_path: Path, isolated_home: Path) -> None:
-    rc = (FIXTURES / "armis.dazelrc").read_text(encoding="utf-8")
+    rc = LOCAL_DAZELRC.read_text(encoding="utf-8")
     cfg = load(make_workspace(tmp_path, rc), {"HOME": str(isolated_home)})
     assert cfg.network == "default"
     assert cfg.run_deps == (
@@ -187,23 +228,79 @@ def test_armis_local_rc_values(tmp_path: Path, isolated_home: Path) -> None:
     assert not any("cli-plugins" in volume for volume in cfg.volumes)
     assert not any("$" in volume for volume in cfg.volumes)
     assert cfg.compose_file == cfg.directory / "deploy/build/docker-compose.dazel.yml"
+    assert cfg.per_workspace_container is True
+    assert cfg.bazel_disk_cache is None
+    cache_volume = f"{isolated_home}/.cache/bazel-disk:/root/.cache/bazel-disk"
+    assert cfg.volumes.count(cache_volume) == 1
+    assert (isolated_home / ".cache/bazel-disk").is_dir()
 
 
 def test_armis_ci_rc_values(tmp_path: Path, isolated_home: Path) -> None:
-    rc = (FIXTURES / "armis_ci.dazelrc").read_text(encoding="utf-8")
-    env = {"HOME": str(isolated_home), "PWD": "/w", "OKTA_CLIENT_ID": "id"}
-    cfg = load(make_workspace(tmp_path, rc), env)
+    rc = CI_DAZELRC.read_text(encoding="utf-8")
+    workspace = make_workspace(tmp_path, rc)
+    env = {"HOME": str(isolated_home), "PWD": "/stale", "OKTA_CLIENT_ID": "id"}
+    cfg = load(workspace, env)
     assert cfg.command == ("/usr/bin/bazel", "--noworkspace_rc")
     assert cfg.bazel_rc_file == "deploy/.bazelrc"
     assert cfg.workspace_hex is True
+    assert cfg.per_workspace_container is False
+    assert cfg.bazel_disk_cache is None
     assert cfg.shm_size == "1024m"
-    assert (
-        "/mnt/jenkins_data/workspace/bazel_disk_cache:/mnt/jenkins_data/workspace/bazel_disk_cache"
-        in cfg.volumes
-    )
+    assert "/mnt/jenkins_data/workspace/bazel_disk_cache:/mnt/jenkins_data/workspace/bazel_disk_cache" in cfg.volumes
     assert cfg.env_vars == (
         "OKTA_CLIENT_ID=id",
-        "OKTA_CLIENT_SECRET=''",
-        "CA_CERT_PATH=''",
-        "GIT_ASKPASS=/w/.github.com",
+        "OKTA_CLIENT_SECRET=",
+        "CA_CERT_PATH=",
+        f"GIT_ASKPASS={workspace}/.github.com",
     )
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [
+        ('"$HOME/run"', "{home}/run"),
+        ('"~/run"', "{home}/run"),
+        ('"${RUN_DIR:-state}/id"', "{workspace}/state/id"),
+        ('".dazel_run"', "{workspace}/.dazel_run"),
+    ],
+)
+def test_run_file_expands_variables_and_the_home_directory(
+    tmp_path: Path, isolated_home: Path, setting: str, expected: str
+) -> None:
+    workspace = make_workspace(tmp_path, f"DAZEL_RUN_FILE = {setting}\n")
+    cfg = load(workspace, {"HOME": str(isolated_home)})
+    assert cfg.run_file == Path(expected.format(home=isolated_home, workspace=workspace.resolve()))
+
+
+@pytest.mark.parametrize("key", ["DOCKERFILE", "DOCKER_COMPOSE_FILE"])
+def test_file_settings_expand_variables_and_the_home_directory(tmp_path: Path, isolated_home: Path, key: str) -> None:
+    workspace = make_workspace(tmp_path, f'DAZEL_{key} = "~/$NAME"\n')
+    cfg = load(workspace, {"HOME": str(isolated_home), "NAME": "file"})
+    value = cfg.dockerfile if key == "DOCKERFILE" else cfg.compose_file
+    assert value == isolated_home / "file"
+
+
+def test_pwd_in_a_value_is_the_real_working_directory_not_the_stale_environment_one(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path, 'DAZEL_ENV_VARS = "ASKPASS=${PWD}/x"\n')
+    assert load(workspace, {"PWD": "/stale"}).env_vars == (f"ASKPASS={workspace}/x",)
+
+
+CI_CACHE_FROM = "--cache-from 123456789012.dkr.ecr.us-east-1.amazonaws.com/armis/dazel"
+
+
+@pytest.mark.parametrize(
+    ("previous", "expected"),
+    [
+        ("dazel_abc123", ["--cache-from", "armis/dazel_abc123"]),
+        ("", []),
+    ],
+)
+def test_the_build_args_ci_passes_reach_docker_build_as_plain_flags(
+    tmp_path: Path, previous: str, expected: list[str]
+) -> None:
+    prev_flag = f" --cache-from armis/{previous}" if previous else ""
+    workspace = make_workspace(tmp_path)
+    cfg = load(workspace, {"DAZEL_DOCKER_BUILD_ARGS": f"{CI_CACHE_FROM}{prev_flag}"})
+    argv = build_argv(cfg, make_plan(cfg))
+    flags = argv[argv.index("build") + 1 : argv.index("-t")]
+    assert flags == ["--cache-from", CI_CACHE_FROM.split()[1], *expected]

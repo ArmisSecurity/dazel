@@ -9,6 +9,7 @@ from dazel.config import Config
 
 OUTPUT_SUBDIRS = ("external", "action_cache", "execroot")
 BAZEL_ROOT_MARKER = "/_bazel"
+README_NAME = "README"
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +19,18 @@ class OutputLayout:
     user_root: str = ""
     base: Path | None = None
     mount_dirs: tuple[Path, ...] = ()
+
+
+def write_workspace_marker(base: Path, workdir: Path) -> None:
+    """Record on the host which workspace ``base`` belongs to, in bazel's own README format.
+
+    Only the subdirectories of a base are bind mounted, so bazel's real README stays inside the
+    container. Writing the same first line beside them lets host cleanup tools tell a base from an
+    orphan: the container sees the workspace at the same path as the host, so it is ``workdir``.
+    """
+    (base / README_NAME).write_text(
+        f"WORKSPACE: {workdir}\n\nWritten by dazel; bazel's own README is inside the container.\n", encoding="utf-8"
+    )
 
 
 def container_user_root() -> str:

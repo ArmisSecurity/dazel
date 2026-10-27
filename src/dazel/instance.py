@@ -5,17 +5,20 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Self
 
 from dazel import docker
-from dazel.bazel import bazel_argv
+from dazel.bazel import bazel_argv, write_workspace_marker
 from dazel.clean import clean_workspace
 from dazel.compose import compose_steps
 from dazel.config import Config, load_config
 from dazel.docker import Terminal
 from dazel.executor import Executor, Output, executor_for
+from dazel.legacy import clean_legacy
+from dazel.lock import LOCK_NAME, exclusive_lock
 from dazel.plan import Plan, host_dirs_to_create, is_predefined_network, make_plan
 
 logger = logging.getLogger("dazel")
@@ -63,18 +66,16 @@ class DockerInstance:
         """The configured docker command line, as a string."""
         return " ".join(self.config.docker_command)
 
-    def _exec_prefix(self) -> list[str]:
-        return [*self.config.docker_command, "exec", self.plan.instance_name]
-
     def needs_start(self) -> bool:
         """Return whether the container must be (re)started before running a command."""
         cfg = self.config
-        if not cfg.run_file.exists() or not self.is_running():
+        if not self.is_running():
             return True
-        return (
-            cfg.dockerfile.exists()
-            and cfg.dockerfile.stat().st_ctime > cfg.run_file.stat().st_ctime
-        )
+        if cfg.run_file is None:
+            return False
+        if not cfg.run_file.exists():
+            return True
+        return cfg.dockerfile.exists() and cfg.dockerfile.stat().st_ctime > cfg.run_file.stat().st_ctime
 
     def is_running(self) -> bool:
         """Return whether the container runs with this workspace bound and on the right network."""
@@ -84,9 +85,7 @@ class DockerInstance:
             return False
         workspace_bind = f"{plan.workdir}:{plan.workdir}"
         binds = self._inspect(BINDS_TEMPLATE)
-        if not any(
-            bind == workspace_bind or bind.startswith(f"{workspace_bind}:") for bind in binds
-        ):
+        if not any(bind == workspace_bind or bind.startswith(f"{workspace_bind}:") for bind in binds):
             return False
         return not plan.network or plan.network in self._inspect(NETWORKS_TEMPLATE)
 
@@ -101,15 +100,40 @@ class DockerInstance:
         argv = docker.exec_argv(self.config, self.plan, self._terminal(), inner)
         return self._executor.call(argv, output=Output.INHERIT)
 
-    def start(self) -> int:
-        """Build or pull the image, start its dependencies, then run the container."""
+    def start(self, *, only_if_needed: bool = False) -> int:
+        """Build or pull the image, start its dependencies, then run the container.
+
+        With ``only_if_needed`` the need is checked again once the start-up lock is held, so of
+        several dazels started together in one workspace only the first one starts the container.
+        """
         cfg, plan, executor = self.config, self.plan, self._executor
         if not executor.exists(cfg.docker_command[0]):
             logger.error("ERROR: Docker executable could not be found!")
             return 1
-        if (rc := self._ensure_image()) or (rc := self._start_dependencies()):
-            return rc
-        return self._run_container(docker.run_argv(cfg, plan))
+        with exclusive_lock(self.lock_path, lambda: logger.warning("Waiting for another dazel start-up...")):
+            if only_if_needed and not self.needs_start():
+                return 0
+            self._remove_legacy_container()
+            if (rc := self._ensure_image()) or (rc := self._start_dependencies()):
+                return rc
+            return self._run_container(docker.run_argv(cfg, plan))
+
+    @property
+    def lock_path(self) -> Path:
+        """The lock file shared by every dazel of this user, next to the bazel output bases."""
+        root = self.config.bazel_user_output_root
+        return (Path(root) if root else Path(tempfile.gettempdir())) / LOCK_NAME
+
+    def _remove_legacy_container(self) -> None:
+        cfg, plan, executor = self.config, self.plan, self._executor
+        legacy = cfg.instance_name
+        if not cfg.per_workspace_container or legacy == plan.instance_name:
+            return
+        if legacy not in executor.capture(docker.ps_argv(cfg, legacy, include_stopped=True)).split():
+            return
+        logger.warning("Removing the legacy shared container '%s' (it holds the published ports)", legacy)
+        executor.call(docker.stop_argv(cfg, legacy), output=Output.DISCARD)
+        executor.call(docker.rm_argv(cfg, legacy), output=Output.DISCARD)
 
     def _ensure_image(self) -> int:
         cfg, plan = self.config, self.plan
@@ -144,7 +168,7 @@ class DockerInstance:
 
     def _start_run_deps(self) -> int:
         cfg, plan = self.config, self.plan
-        for dep in cfg.run_deps:
+        for dep in plan.run_deps:
             if dep.name in self._executor.capture(docker.ps_argv(cfg, dep.name)).split():
                 continue
             logger.info("Starting run dependency: '%s' (name: '%s')", dep.image, dep.name)
@@ -159,13 +183,20 @@ class DockerInstance:
         logger.info("Starting docker container '%s'...", plan.instance_name)
         for path in host_dirs_to_create(plan, cfg):
             path.mkdir(parents=True, exist_ok=True)
+        if plan.digest and plan.layout.base:
+            write_workspace_marker(plan.layout.base, plan.workspace)
         self._executor.call(docker.stop_argv(cfg, plan.instance_name), output=Output.DISCARD)
         self._executor.call(docker.rm_argv(cfg, plan.instance_name), output=Output.DISCARD)
         if rc := self._executor.call(run):
             return rc
-        cfg.run_file.write_text(f"{plan.instance_name}\n", encoding="utf-8")
+        if cfg.run_file:
+            cfg.run_file.write_text(f"{plan.instance_name}\n", encoding="utf-8")
         return 0
 
     def clean_workspace(self) -> int:
         """Remove this workspace's container and output base."""
         return clean_workspace(self.config, self.plan, self._executor)
+
+    def clean_legacy(self, *, delete: bool) -> list[Path]:
+        """List (and with ``delete`` remove) the legacy shared output base under the output root."""
+        return clean_legacy(self.config, self.plan, self._executor, delete=delete)

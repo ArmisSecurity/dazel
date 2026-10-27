@@ -150,7 +150,7 @@ dev = [
     { name = "pyrefly", specifier = ">=0.30" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-cov", specifier = ">=5" },
-    { name = "ruff", specifier = ">=0.8" },
+    { name = "ruff", specifier = ">=0.15" },
 ]
 
 [[package]]
