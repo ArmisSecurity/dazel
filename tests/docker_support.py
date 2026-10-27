@@ -22,8 +22,9 @@ from dazel import DockerInstance
 
 from fake_support import make_workspace
 
-# The ECR Public mirror of Docker Hub's official image: no anonymous pull rate limit on CI runners.
-BASE_IMAGE = "public.ecr.aws/docker/library/alpine:3.20"
+# Google's mirror of Docker Hub's official images: Docker Hub and ECR Public both throttle the
+# anonymous pulls of shared CI runners.
+BASE_IMAGE = "mirror.gcr.io/library/alpine:3.20"
 REQUIRE_DOCKER_VARIABLE = "DAZEL_REQUIRE_DOCKER"
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "t",

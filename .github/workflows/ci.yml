@@ -82,7 +82,11 @@ jobs:
         run: |
           docker info --format '{{.ServerVersion}}'
           docker compose version
-          docker pull public.ecr.aws/docker/library/alpine:3.20
+          for attempt in 1 2 3; do
+            docker pull mirror.gcr.io/library/alpine:3.20 && exit 0
+            sleep $((attempt * 15))
+          done
+          exit 1
       - run: uv run pytest -m integration --no-cov
 
   package:
