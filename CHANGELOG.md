@@ -48,7 +48,7 @@ behaviour changes.
 
 ## [0.0.43] - 2025-06-30
 
-- `DAZEL_PLATFORM` passes `--platform` to `docker build` and `docker run` ([#70](https://github.com/nadirizr/dazel/pull/70)).
+- `DAZEL_PLATFORM` passes `--platform` to `docker run` ([#70](https://github.com/nadirizr/dazel/pull/70)).
 - The container runs with `--ulimit nofile=1048576:1048576`. This change was published to PyPI but never committed upstream.
 
 ## [0.0.42] - 2023-11-16
