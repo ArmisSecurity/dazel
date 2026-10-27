@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from dazel import DockerInstance
+
 from fake_support import make_workspace
 
 # The ECR Public mirror of Docker Hub's official image: no anonymous pull rate limit on CI runners.

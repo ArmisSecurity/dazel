@@ -7,6 +7,7 @@ from dazel.clean import UnsafeCleanError
 from dazel.config import Config
 from dazel.legacy import clean_legacy, legacy_paths
 from dazel.plan import Plan, make_plan
+
 from fake_support import FakeExecutor, build_config, make_workspace
 
 MD5 = "0123456789abcdef0123456789abcdef"

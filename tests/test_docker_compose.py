@@ -8,6 +8,7 @@ from dazel.compose import compose_steps
 from dazel.config import Config, RunDep
 from dazel.docker import Terminal
 from dazel.plan import Plan, make_plan
+
 from fake_support import build_config, make_linked_worktree, make_workspace
 
 TERMINAL = Terminal(columns=120, lines=40, term="xterm", tty=True)

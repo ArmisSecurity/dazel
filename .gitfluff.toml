@@ -1,0 +1,5 @@
+preset = "conventional"
+write = true
+
+[rules]
+ai_cleanup = true

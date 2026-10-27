@@ -6,6 +6,7 @@ import pytest
 
 from dazel import cli
 from dazel.clean import UnsafeCleanError
+
 from docker_support import (
     BASE_IMAGE,
     Lab,

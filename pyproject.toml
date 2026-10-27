@@ -86,7 +86,7 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["dazel"]
-known-local-folder = ["fakes", "conftest"]
+known-local-folder = ["conftest", "docker_support", "fake_support"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

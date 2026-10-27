@@ -18,6 +18,7 @@ from dazel.executor import Output
 from dazel.plan import make_plan
 from dazel.version import UNKNOWN_VERSION, installed_version
 from dazel.workspace import workspace_digest
+
 from fake_support import FakeExecutor, build_config, make_workspace, run_file_of
 
 

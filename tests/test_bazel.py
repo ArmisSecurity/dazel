@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from dazel.bazel import OutputLayout, bazel_argv, derive_user_root, output_layout
+
 from fake_support import build_config, make_workspace
 
 

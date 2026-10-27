@@ -15,6 +15,7 @@ from dazel import DockerInstance
 from dazel import instance as instance_module
 from dazel.docker import Terminal
 from dazel.executor import Output
+
 from fake_support import FakeExecutor, build_config, make_workspace, run_file_of
 
 TERMINAL = Terminal(100, 30, "xterm", tty=False)
