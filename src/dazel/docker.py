@@ -71,6 +71,7 @@ def run_argv(cfg: Config, plan: Plan) -> list[str]:
         *_each("-p", plan.ports),
         *_each("-e", cfg.env_vars),
         *(["--gpus", ",".join(cfg.gpus)] if cfg.gpus else []),
+        *_each("--group-add", cfg.groups),
         *([f"--shm-size={cfg.shm_size}"] if cfg.shm_size else []),
         *([f"--net={plan.network}"] if plan.network else []),
         image_ref(cfg, plan),
@@ -92,14 +93,17 @@ def run_dep_argv(cfg: Config, plan: Plan, dep: RunDep) -> list[str]:
 
 
 def build_argv(cfg: Config, plan: Plan) -> list[str]:
-    """Build ``docker build`` for the image from the configured Dockerfile."""
+    """Build ``docker build`` for the image from the configured Dockerfile.
+
+    The build context is ``DAZEL_BUILD_DIRECTORY`` when set, the workspace root otherwise.
+    """
     return [
         *cfg.docker_command,
         "build",
         *cfg.docker_build_args,
         *("-t", image_ref(cfg, plan)),
         *("-f", str(cfg.dockerfile)),
-        str(cfg.directory),
+        str(cfg.build_directory or cfg.directory),
     ]
 
 

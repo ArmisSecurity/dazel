@@ -67,7 +67,11 @@ class DockerInstance:
         return " ".join(self.config.docker_command)
 
     def needs_start(self) -> bool:
-        """Return whether the container must be (re)started before running a command."""
+        """Return whether the container must be (re)started before running a command.
+
+        A running container is restarted when its Dockerfile or any rc file it was configured from
+        changed since the run file was written.
+        """
         cfg = self.config
         if not self.is_running():
             return True
@@ -75,7 +79,9 @@ class DockerInstance:
             return False
         if not cfg.run_file.exists():
             return True
-        return cfg.dockerfile.exists() and cfg.dockerfile.stat().st_ctime > cfg.run_file.stat().st_ctime
+        started = cfg.run_file.stat().st_ctime
+        inputs = (cfg.dockerfile, *cfg.rc_files)
+        return any(path.exists() and path.stat().st_ctime > started for path in inputs)
 
     def is_running(self) -> bool:
         """Return whether the container runs with this workspace bound and on the right network."""

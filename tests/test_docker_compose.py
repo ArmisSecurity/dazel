@@ -270,3 +270,23 @@ def test_compose_has_no_project_directory_outside_per_workspace_mode(tmp_path: P
 def test_no_compose_file_no_steps(tmp_path: Path) -> None:
     cfg = build_config(make_workspace(tmp_path))
     assert compose_steps(cfg, make_plan(cfg)) == []
+
+
+def test_build_argv_uses_the_configured_build_directory_as_context(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    cfg = build_config(workspace, {"DAZEL_BUILD_DIRECTORY": "images", "DAZEL_DOCKERFILE": "images/Dockerfile"})
+    argv = docker.build_argv(cfg, make_plan(cfg))
+    root = workspace.resolve()
+    assert argv[-3:] == ["-f", f"{root}/images/Dockerfile", f"{root}/images"]
+
+
+@pytest.mark.parametrize(
+    ("groups", "expected"),
+    [("", []), ("docker", ["--group-add", "docker"]), ("docker,44", ["--group-add", "docker", "--group-add", "44"])],
+    ids=["none", "one", "two"],
+)
+def test_run_argv_adds_each_group(tmp_path: Path, groups: str, expected: list[str]) -> None:
+    cfg = build_config(make_workspace(tmp_path), {"DAZEL_GROUPS": groups} if groups else {})
+    argv = docker.run_argv(cfg, make_plan(cfg))
+    flags = [part for index, flag in enumerate(argv) if flag == "--group-add" for part in argv[index : index + 2]]
+    assert flags == expected

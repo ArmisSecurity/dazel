@@ -305,3 +305,87 @@ def test_the_build_args_ci_passes_reach_docker_build_as_plain_flags(
     argv = build_argv(cfg, make_plan(cfg))
     flags = argv[argv.index("build") + 1 : argv.index("-t")]
     assert flags == ["--cache-from", CI_CACHE_FROM.split()[1], *expected]
+
+
+SHM = 'DAZEL_SHM_SIZE = "{}"\n'
+
+
+@pytest.mark.parametrize(
+    ("rc_files", "env", "expected"),
+    [
+        ((SHM.format("1g"), "", ""), {}, "1g"),
+        ((SHM.format("1g"), SHM.format("2g"), ""), {}, "2g"),
+        ((SHM.format("1g"), SHM.format("2g"), SHM.format("3g")), {}, "3g"),
+        (("", SHM.format("2g"), SHM.format("3g")), {"DAZEL_SHM_SIZE": "4g"}, "4g"),
+        (("", SHM.format("2g"), 'DAZEL_PLATFORM = "linux/arm64"\n'), {}, "2g"),
+    ],
+    ids=["home", "project-over-home", "local-over-project", "env-over-local", "local-leaves-other-keys"],
+)
+def test_rc_files_layer_home_project_local_then_environment(
+    tmp_path: Path, isolated_home: Path, rc_files: tuple[str, str, str], env: dict[str, str], expected: str
+) -> None:
+    home_rc, project_rc, local_rc = rc_files
+    workspace = make_workspace(tmp_path, project_rc)
+    if home_rc:
+        (isolated_home / ".dazelrc").write_text(home_rc, encoding="utf-8")
+    if local_rc:
+        (workspace / ".dazelrc.local").write_text(local_rc, encoding="utf-8")
+    assert load(workspace, env).shm_size == expected
+
+
+def test_rc_files_lists_only_the_files_read_lowest_precedence_first(tmp_path: Path, isolated_home: Path) -> None:
+    workspace = make_workspace(tmp_path, 'DAZEL_SHM_SIZE = "2g"\n')
+    (isolated_home / ".dazelrc").write_text("", encoding="utf-8")
+    (workspace / ".dazelrc.local").write_text("", encoding="utf-8")
+    assert load(workspace).rc_files == (
+        isolated_home / ".dazelrc",
+        workspace / ".dazelrc",
+        workspace / ".dazelrc.local",
+    )
+    (workspace / ".dazelrc.local").unlink()
+    assert load(workspace).rc_files == (isolated_home / ".dazelrc", workspace / ".dazelrc")
+
+
+def test_a_list_in_the_local_rc_replaces_the_project_list(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path, 'DAZEL_GPUS = ["0", "1"]\n')
+    (workspace / ".dazelrc.local").write_text('DAZEL_GPUS = ["2"]\n', encoding="utf-8")
+    assert load(workspace).gpus == ("2",)
+
+
+def test_the_local_rc_still_applies_over_a_selected_rc_file(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    selected = tmp_path / "ci.dazelrc"
+    selected.write_text('DAZEL_SHM_SIZE = "2g"\nDAZEL_PLATFORM = "linux/amd64"\n', encoding="utf-8")
+    (workspace / ".dazelrc.local").write_text('DAZEL_SHM_SIZE = "3g"\n', encoding="utf-8")
+    cfg = load(workspace, {"DAZEL_RC_FILE": str(selected)})
+    assert (cfg.shm_size, cfg.platform) == ("3g", "linux/amd64")
+
+
+def test_a_workspace_at_home_reads_its_rc_file_once(isolated_home: Path) -> None:
+    (isolated_home / "WORKSPACE").touch()
+    (isolated_home / ".dazelrc").write_text('DAZEL_SHM_SIZE = "1g"\n', encoding="utf-8")
+    assert load(isolated_home).rc_files == (isolated_home / ".dazelrc",)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("", None), ("docker", "docker"), ("/abs/context", "/abs/context")],
+    ids=["unset", "relative", "absolute"],
+)
+def test_build_directory_resolves_against_the_workspace(tmp_path: Path, value: str, expected: str | None) -> None:
+    workspace = make_workspace(tmp_path)
+    cfg = load(workspace, {"DAZEL_BUILD_DIRECTORY": value} if value else {})
+    assert cfg.build_directory == (None if expected is None else workspace.resolve() / expected)
+
+
+@pytest.mark.parametrize(
+    ("rc", "expected"),
+    [
+        ("", ()),
+        ('DAZEL_GROUPS = "docker, video"\n', ("docker", "video")),
+        ('DAZEL_GROUPS = ["docker", 44]\n', ("docker", "44")),
+    ],
+    ids=["unset", "comma-string", "list"],
+)
+def test_groups_accept_a_comma_string_or_a_list(tmp_path: Path, rc: str, expected: tuple[str, ...]) -> None:
+    assert load(make_workspace(tmp_path, rc)).groups == expected

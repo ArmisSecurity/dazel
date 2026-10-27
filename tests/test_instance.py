@@ -400,3 +400,25 @@ def test_start_writes_no_workspace_record_in_shared_mode(tmp_path: Path) -> None
     inst = instance(make_workspace(tmp_path), FakeExecutor())
     inst.start()
     assert not (tmp_path / "out" / "README").exists()
+
+
+@pytest.mark.parametrize("rc_name", [".dazelrc", ".dazelrc.local", "home"], ids=["project", "local", "home"])
+@pytest.mark.parametrize("changed", [True, False], ids=["changed", "unchanged"])
+def test_needs_start_when_an_rc_file_changed_after_the_run_file(
+    tmp_path: Path, isolated_home: Path, rc_name: str, *, changed: bool
+) -> None:
+    workspace = make_workspace(tmp_path)
+    rc = isolated_home / ".dazelrc" if rc_name == "home" else workspace / rc_name
+    rc.write_text('DAZEL_SHM_SIZE = "1g"\n', encoding="utf-8")
+    executor = FakeExecutor()
+    inst = instance(workspace, executor)
+    executor.captures = running(inst)
+    run_file = run_file_of(inst.config)
+    run_file.write_text("dazel\n", encoding="utf-8")
+    if changed:
+        rc.chmod(0o600)
+        if rc.stat().st_ctime <= run_file.stat().st_ctime:
+            pytest.skip("filesystem does not advance ctime")
+    else:
+        assert rc.stat().st_ctime <= run_file.stat().st_ctime
+    assert inst.needs_start() is changed

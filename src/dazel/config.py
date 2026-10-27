@@ -4,7 +4,7 @@ import getpass
 import runpy
 import shlex
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +12,7 @@ from dazel.env import expand_variables
 from dazel.workspace import find_workspace
 
 RC_FILE_NAME = ".dazelrc"
+LOCAL_RC_FILE_NAME = ".dazelrc.local"
 ENV_PREFIX = "DAZEL_"
 FALSE_WORDS = frozenset({"", "0", "false", "no", "off", "none"})
 
@@ -65,12 +66,14 @@ class Config:
     run_command: tuple[str, ...] = (DEFAULT_RUN_COMMAND,)
     docker_command: tuple[str, ...] = (DEFAULT_DOCKER_COMMAND,)
     dockerfile: Path = Path(DEFAULT_DOCKERFILE)
+    build_directory: Path | None = None
     repository: str = DEFAULT_REPOSITORY
     command: tuple[str, ...] = (DEFAULT_COMMAND,)
     volumes: tuple[str, ...] = ()
     ports: tuple[str, ...] = ()
     env_vars: tuple[str, ...] = ()
     gpus: tuple[str, ...] = ()
+    groups: tuple[str, ...] = ()
     platform: str = ""
     shm_size: str = ""
     network: str = DEFAULT_NETWORK
@@ -91,6 +94,7 @@ class Config:
     per_workspace_container: bool = False
     ports_only_primary: bool | None = None
     bazel_disk_cache: DiskCache | None = None
+    rc_files: tuple[Path, ...] = ()
 
 
 def default_user_output_root() -> str:
@@ -104,19 +108,35 @@ def load_rc(path: Path) -> RawConfig:
     return {key: value for key, value in namespace.items() if key.startswith(ENV_PREFIX)}
 
 
+def rc_candidates(env: Mapping[str, str], directory: Path) -> tuple[Path, ...]:
+    """Return the rc files dazel reads for ``directory``, lowest precedence first.
+
+    ``~/.dazelrc`` holds per-user defaults, the workspace ``.dazelrc`` (or ``DAZEL_RC_FILE``) the
+    project's configuration, and an uncommitted ``.dazelrc.local`` beside it a developer's overrides.
+    A file reached twice (a workspace at ``~``) is read once.
+    """
+    home = Path(env.get("HOME", "~")).expanduser()
+    project = Path(env.get("DAZEL_RC_FILE", directory / RC_FILE_NAME))
+    paths = (home / RC_FILE_NAME, project, directory / LOCAL_RC_FILE_NAME)
+    return tuple(dict.fromkeys(path.absolute() for path in paths))
+
+
 def load_config(env: Mapping[str, str], cwd: Path) -> Config:
     """Build the configuration for the workspace containing ``cwd``.
 
-    Precedence, lowest to highest: defaults, ``.dazelrc``, ``DAZEL_*`` environment variables.
-    ``DAZEL_RC_FILE`` selects another rc file. ``DAZEL_DIRECTORY`` is where the workspace search
-    starts and, when set, the directory that is mounted and used as the container's working
+    Precedence, lowest to highest: defaults, ``~/.dazelrc``, ``.dazelrc``, ``.dazelrc.local``,
+    ``DAZEL_*`` environment variables. A key set in a later file replaces the earlier value whole.
+    ``DAZEL_RC_FILE`` selects another project rc file. ``DAZEL_DIRECTORY`` is where the workspace
+    search starts and, when set, the directory that is mounted and used as the container's working
     directory instead of the workspace root found.
     """
     directory = find_workspace(Path(env.get("DAZEL_DIRECTORY", cwd)))
-    rc_path = Path(env.get("DAZEL_RC_FILE", directory / RC_FILE_NAME))
-    raw = load_rc(rc_path) if rc_path.exists() else {}
+    rc_files = tuple(path for path in rc_candidates(env, directory) if path.is_file())
+    raw: RawConfig = {}
+    for path in rc_files:
+        raw.update(load_rc(path))
     raw.update({k: v for k, v in env.items() if k.startswith(ENV_PREFIX)})
-    return resolve(raw, directory, {**env, "PWD": str(cwd)})
+    return replace(resolve(raw, directory, {**env, "PWD": str(cwd)}), rc_files=rc_files)
 
 
 def _split_words(key: str, value: object) -> tuple[str, ...]:
@@ -209,12 +229,14 @@ def resolve(raw: RawConfig, directory: Path, env: Mapping[str, str]) -> Config:
         run_command=source.argv("RUN_COMMAND", DEFAULT_RUN_COMMAND),
         docker_command=source.argv("DOCKER_COMMAND", DEFAULT_DOCKER_COMMAND),
         dockerfile=source.path("DOCKERFILE", directory) or directory / DEFAULT_DOCKERFILE,
+        build_directory=source.path("BUILD_DIRECTORY", directory),
         repository=source.text("REPOSITORY", DEFAULT_REPOSITORY),
         command=source.argv("COMMAND", DEFAULT_COMMAND),
         volumes=source.expanded("VOLUMES"),
         ports=source.expanded("PORTS"),
         env_vars=source.expanded("ENV_VARS"),
         gpus=source.words("GPUS"),
+        groups=source.words("GROUPS"),
         platform=source.text("PLATFORM"),
         shm_size=source.text("SHM_SIZE"),
         network=source.text("NETWORK", DEFAULT_NETWORK),
